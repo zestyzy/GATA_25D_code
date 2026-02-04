@@ -1,0 +1,10 @@
+# 排除外层文件夹
+.claude/
+data/
+pretrain/
+result/
+
+# 排除 Python 缓存（包括 code 里的）
+__pycache__/
+*.py[cod]
+*$py.class
