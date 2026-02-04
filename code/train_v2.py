@@ -178,15 +178,16 @@ def get_dataloaders(args):
 
 
 def train_epoch(model, dataloader, criterion, optimizer, device, epoch, args):
-    """训练一个epoch，带tqdm进度条"""
+    """训练一个epoch，带tqdm进度条
+    分类指标按case级别聚合计算，与验证阶段保持一致
+    """
     model.train()
     total_loss = 0
     total_seg_loss = 0
     total_cls_loss = 0
 
-    all_preds = []
-    all_labels = []
-    all_probs = []  # 收集正类概率
+    # case级别聚合 - 与验证阶段保持一致
+    case_predictions = {}  # case_id -> {'cls_probs': [], 'label': int}
 
     # 使用tqdm包装dataloader
     pbar = tqdm(dataloader, desc=f'Epoch {epoch+1} [Train]', leave=False)
@@ -200,11 +201,13 @@ def train_epoch(model, dataloader, criterion, optimizer, device, epoch, args):
             mid_d = images.shape[2] // 2
             pancreas_masks = batch['pancreas_mask'][:, 0, mid_d, :, :].unsqueeze(1).to(device)
             gata6_labels = batch['gata6_label'].to(device)
+            case_ids = batch['case_id']
         else:
             # 2.5D输入: (B, slices_per_input, H, W)
             images = batch['image'].to(device)
             pancreas_masks = batch['pancreas_mask'].unsqueeze(1).to(device)
             gata6_labels = batch['gata6_label'].to(device)
+            case_ids = batch['case_id']
 
         optimizer.zero_grad()
 
@@ -228,15 +231,18 @@ def train_epoch(model, dataloader, criterion, optimizer, device, epoch, args):
         total_seg_loss += losses['seg'].item()
         total_cls_loss += losses['cls'].item()
 
-        # 收集分类预测 (使用阈值而不是argmax)
-        cls_probs = torch.softmax(outputs['classification'], dim=1)
-        pos_probs = cls_probs[:, 1].cpu().numpy()  # 正类概率
-        # 使用0.4阈值而不是0.5来应对类别不平衡
-        cls_pred = (pos_probs >= 0.4).astype(int)
+        # 收集分类预测 (按case聚合)
+        cls_probs = torch.softmax(outputs['classification'], dim=1).cpu().numpy()
+        pos_probs = cls_probs[:, 1]  # 正类概率
 
-        all_preds.extend(cls_pred)
-        all_labels.extend(gata6_labels.cpu().numpy())
-        all_probs.extend(pos_probs)
+        for i, case_id in enumerate(case_ids):
+            case_id = int(case_id)
+            if case_id not in case_predictions:
+                case_predictions[case_id] = {
+                    'cls_probs': [],
+                    'label': int(gata6_labels[i].item())
+                }
+            case_predictions[case_id]['cls_probs'].append(pos_probs[i])
 
         # 更新进度条显示
         current_loss = total_loss / (batch_idx + 1)
@@ -248,10 +254,29 @@ def train_epoch(model, dataloader, criterion, optimizer, device, epoch, args):
             'cls': f'{current_cls:.4f}'
         })
 
+    # 按case聚合计算指标 (与验证阶段一致)
+    all_preds = []
+    all_labels = []
+    all_probs = []
+
+    for case_id, case_data in case_predictions.items():
+        # 聚合分类预测 (取平均)
+        case_probs = np.array(case_data['cls_probs'])
+        avg_prob = case_probs.mean()
+
+        # 使用0.4阈值
+        pred_label = 1 if avg_prob >= 0.4 else 0
+
+        all_preds.append(pred_label)
+        all_labels.append(case_data['label'])
+        all_probs.append(avg_prob)
+
     n_batches = len(dataloader)
     avg_loss = total_loss / n_batches
     avg_seg_loss = total_seg_loss / n_batches
     avg_cls_loss = total_cls_loss / n_batches
+
+    # 计算case-level指标
     cls_acc = accuracy_score(all_labels, all_preds)
     cls_f1 = f1_score(all_labels, all_preds, zero_division=0)
     cls_precision = precision_score(all_labels, all_preds, zero_division=0)
@@ -260,6 +285,8 @@ def train_epoch(model, dataloader, criterion, optimizer, device, epoch, args):
     # 打印训练分类指标 (合并为一行)
     print(f"  [Train] Acc: {cls_acc:.4f}, Precision: {cls_precision:.4f}, "
           f"Recall: {cls_recall:.4f}, F1: {cls_f1:.4f}")
+    print(f"  [Train Distribution] Pred: Pos={sum(all_preds)}, Neg={len(all_preds)-sum(all_preds)} | "
+          f"True: Pos={sum(all_labels)}, Neg={len(all_labels)-sum(all_labels)}")
 
     return {
         'loss': avg_loss,
@@ -366,7 +393,7 @@ def validate(model, dataloader, criterion, device, args, cls_threshold=None, epo
         current_loss = total_loss / (batch_idx + 1)
         pbar.set_postfix({'val_loss': f'{current_loss:.4f}'})
 
-    # ========== 聚合case级别预测并计算真实Dice ==========
+    # ========== 聚合case级别预测并计算Dice ==========
     all_preds = []
     all_labels = []
     all_probs = []
@@ -379,7 +406,7 @@ def validate(model, dataloader, criterion, device, args, cls_threshold=None, epo
     case_ids_list = list(case_predictions.keys())
     selected_case_for_vis = random.choice(case_ids_list) if len(case_ids_list) > 0 else None
 
-    depth = args.depth if args.train_mode == 'slice' else args.depth
+    depth = args.depth
 
     for idx, (case_id, case_data) in enumerate(case_predictions.items()):
         # 聚合分类预测
@@ -413,48 +440,78 @@ def validate(model, dataloader, criterion, device, args, cls_threshold=None, epo
             else:
                 aggregated_seg = seg_outputs.mean(axis=0)
 
-        # 计算真实Dice: 需要聚合真实mask
+        # 计算Dice (2.5D模式计算average 2D Dice，3D/case模式计算3D Dice)
+        vis_mask = None  # 用于可视化的mask
         if len(case_data['masks']) > 0:
-            # 聚合真实mask (对于slice模式需要聚合，对于case模式直接用)
             if args.train_mode == 'slice':
+                # 2.5D模式: 计算每个预测slice的2D Dice，然后取平均
+                # 聚合后的segmentation只有中间部分有有效预测
                 mask_shape = case_data['masks'][0].shape
                 if len(mask_shape) == 3:  # (D, H, W)
-                    # 简化：直接使用第一个完整3D mask（因为每个case的mask应该相同）
-                    # 实际上case_data['masks']中存储的是同一个case的重复mask
-                    aggregated_mask = case_data['masks'][0]
+                    gt_mask_3d = case_data['masks'][0]
 
                     # 确保尺寸一致
-                    if aggregated_mask.shape != (depth, args.image_size, args.image_size):
-                        aggregated_mask = resize_volume(
-                            aggregated_mask,
+                    if gt_mask_3d.shape != (depth, args.image_size, args.image_size):
+                        gt_mask_3d = resize_volume(
+                            gt_mask_3d,
                             (depth, args.image_size, args.image_size)
                         )
+
+                    vis_mask = gt_mask_3d  # 保存用于可视化
+
+                    # 对于2.5D模型，计算每个被预测位置的2D Dice，然后平均
+                    # 聚合后的预测中，weight_map > 0的位置是有效预测
+                    valid_slices = []
+                    slice_dice_scores = []
+
+                    for d_idx in range(depth):
+                        pred_slice = aggregated_seg[d_idx]
+                        gt_slice = gt_mask_3d[d_idx]
+
+                        # 检查这个slice是否有有效预测 (weight_map > 0)
+                        # 简化：对于stride=1, slices_per_input=3，中间slice都有预测
+                        # 直接计算所有非零预测slice的Dice
+                        if pred_slice.max() > 0 or gt_slice.max() > 0:
+                            dice_2d = compute_2d_dice(pred_slice, gt_slice)
+                            slice_dice_scores.append(dice_2d)
+                            valid_slices.append(d_idx)
+
+                    # 使用平均2D Dice
+                    if len(slice_dice_scores) > 0:
+                        dice = np.mean(slice_dice_scores)
+                    else:
+                        dice = 0.0
                 else:
-                    aggregated_mask = case_data['masks'][0]
+                    # 退化为2D
+                    vis_mask = case_data['masks'][0]
+                    dice = compute_2d_dice(aggregated_seg, case_data['masks'][0])
             else:
-                # case模式：直接使用3D mask
+                # case/3D模式: 计算3D Dice
                 if len(case_data['masks'][0].shape) == 4:
-                    aggregated_mask = case_data['masks'][0][0]  # (1, D, H, W) -> (D, H, W)
+                    aggregated_mask = case_data['masks'][0][0]
                 else:
                     aggregated_mask = case_data['masks'][0]
 
-            # 确保mask和预测尺寸一致
-            if aggregated_mask.shape != aggregated_seg.shape:
-                aggregated_mask = resize_volume(aggregated_mask, aggregated_seg.shape)
+                vis_mask = aggregated_mask  # 保存用于可视化
 
-            # 计算Dice
-            seg_pred_binary = (aggregated_seg > 0.5).astype(np.float32)
-            seg_gt_binary = (aggregated_mask > 0.5).astype(np.float32)
+                # 确保mask和预测尺寸一致
+                if aggregated_mask.shape != aggregated_seg.shape:
+                    aggregated_mask = resize_volume(aggregated_mask, aggregated_seg.shape)
+                    vis_mask = aggregated_mask
 
-            dice = compute_3d_dice(seg_pred_binary, seg_gt_binary)
+                # 计算3D Dice
+                seg_pred_binary = (aggregated_seg > 0.5).astype(np.float32)
+                seg_gt_binary = (aggregated_mask > 0.5).astype(np.float32)
+                dice = compute_3d_dice(seg_pred_binary, seg_gt_binary)
+
             seg_dice_scores.append(dice)
 
             # 保存可视化数据 (随机选择一个case)
-            if case_id == selected_case_for_vis and output_dir is not None:
+            if case_id == selected_case_for_vis and output_dir is not None and vis_mask is not None:
                 vis_case_id = case_id
                 vis_data = {
                     'seg_pred': aggregated_seg,
-                    'seg_gt': aggregated_mask,
+                    'seg_gt': vis_mask,
                     'cls_pred': pred_label,
                     'cls_prob': pred_prob,
                     'cls_gt': case_data['label']
@@ -540,6 +597,27 @@ def compute_3d_dice(pred, target, smooth=1e-5):
     target_flat = target.flatten()
     intersection = (pred_flat * target_flat).sum()
     union = pred_flat.sum() + target_flat.sum()
+    dice = (2. * intersection + smooth) / (union + smooth)
+    return float(dice)
+
+
+def compute_2d_dice(pred, target, smooth=1e-5):
+    """
+    计算2D Dice系数
+    Args:
+        pred: (H, W) 预测概率或二值化预测
+        target: (H, W) 二值化真实标签
+    """
+    # 二值化预测（如果不是的话）
+    pred_binary = (pred > 0.5).astype(np.float32)
+    target_binary = (target > 0.5).astype(np.float32)
+
+    pred_flat = pred_binary.flatten()
+    target_flat = target_binary.flatten()
+
+    intersection = (pred_flat * target_flat).sum()
+    union = pred_flat.sum() + target_flat.sum()
+
     dice = (2. * intersection + smooth) / (union + smooth)
     return float(dice)
 
