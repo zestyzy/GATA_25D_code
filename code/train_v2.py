@@ -187,10 +187,12 @@ def train_epoch(model, dataloader, criterion, optimizer, device, epoch, args):
     total_cls_loss = 0
 
     # case级别聚合
-    case_predictions = {}  # case_id -> {'cls_probs': [], 'label': int}
+    case_predictions = {}  # case_id -> {'cls_probs': [], 'seg_preds': [], 'seg_gts': [], 'label': int}
     # slice级别统计（用于对比，避免重复标签导致的虚高）
     slice_preds = []
     slice_labels = []
+    # 训练分割Dice统计
+    batch_dice_scores = []
 
     # 使用tqdm包装dataloader
     pbar = tqdm(dataloader, desc=f'Epoch {epoch+1} [Train]', leave=False)
@@ -242,14 +244,31 @@ def train_epoch(model, dataloader, criterion, optimizer, device, epoch, args):
         slice_preds.extend(batch_slice_preds)
         slice_labels.extend(gata6_labels.cpu().numpy())
 
+        # 收集分割预测用于计算训练Dice
+        seg_preds = torch.sigmoid(outputs['segmentation']).detach().cpu().numpy()  # (B, 1, H, W)
+        seg_gts = pancreas_masks.cpu().numpy()  # (B, 1, H, W)
+
         for i, case_id in enumerate(case_ids):
             case_id = int(case_id)
             if case_id not in case_predictions:
                 case_predictions[case_id] = {
                     'cls_probs': [],
+                    'seg_preds': [],  # 收集分割预测
+                    'seg_gts': [],    # 收集分割GT
                     'label': int(gata6_labels[i].item())
                 }
             case_predictions[case_id]['cls_probs'].append(pos_probs[i])
+            case_predictions[case_id]['seg_preds'].append(seg_preds[i, 0])  # (H, W)
+            case_predictions[case_id]['seg_gts'].append(seg_gts[i, 0])       # (H, W)
+
+        # 计算当前batch的2D Dice（用于实时监控）
+        with torch.no_grad():
+            seg_pred_binary = (torch.sigmoid(outputs['segmentation']) > 0.5).float()
+            seg_gt_binary = pancreas_masks
+            intersection = (seg_pred_binary * seg_gt_binary).sum(dim=(1, 2, 3))
+            union = seg_pred_binary.sum(dim=(1, 2, 3)) + seg_gt_binary.sum(dim=(1, 2, 3))
+            dice_batch = (2. * intersection + 1e-5) / (union + 1e-5)
+            batch_dice_scores.extend(dice_batch.cpu().numpy())
 
         # 更新进度条显示
         current_loss = total_loss / (batch_idx + 1)
@@ -275,6 +294,8 @@ def train_epoch(model, dataloader, criterion, optimizer, device, epoch, args):
     all_labels = []
     all_probs = []
 
+    # 训练分割Dice计算
+    case_dice_scores = []
     for case_id, case_data in case_predictions.items():
         # 聚合分类预测 (取平均)
         case_probs = np.array(case_data['cls_probs'])
@@ -287,11 +308,27 @@ def train_epoch(model, dataloader, criterion, optimizer, device, epoch, args):
         all_labels.append(case_data['label'])
         all_probs.append(avg_prob)
 
+        # 计算case-level平均2D Dice
+        if len(case_data['seg_preds']) > 0:
+            case_dice_list = []
+            for seg_pred, seg_gt in zip(case_data['seg_preds'], case_data['seg_gts']):
+                # 只计算有GT的slice
+                if seg_gt.max() > 0:
+                    dice_2d = compute_2d_dice(seg_pred, seg_gt)
+                    case_dice_list.append(dice_2d)
+            if len(case_dice_list) > 0:
+                case_dice = np.mean(case_dice_list)
+                case_dice_scores.append(case_dice)
+
     # 计算case-level指标
     cls_acc = accuracy_score(all_labels, all_preds)
     cls_f1 = f1_score(all_labels, all_preds, zero_division=0)
     cls_precision = precision_score(all_labels, all_preds, zero_division=0)
     cls_recall = recall_score(all_labels, all_preds, zero_division=0)
+
+    # 计算训练分割Dice
+    train_seg_dice = np.mean(case_dice_scores) if case_dice_scores else 0.0
+    batch_avg_dice = np.mean(batch_dice_scores) if batch_dice_scores else 0.0
 
     # 打印训练分类指标（区分case-level和slice-level）
     if args.train_mode == 'slice':
@@ -303,6 +340,8 @@ def train_epoch(model, dataloader, criterion, optimizer, device, epoch, args):
         # case模式：只有case-level
         print(f"  [Train] Acc: {cls_acc:.4f}, Precision: {cls_precision:.4f}, "
               f"Recall: {cls_recall:.4f}, F1: {cls_f1:.4f}")
+    # 打印分割Dice
+    print(f"  [Train Segmentation] Case-Dice: {train_seg_dice:.4f}, Batch-Dice: {batch_avg_dice:.4f}")
     print(f"  [Train Distribution] Pred: Pos={sum(all_preds)}, Neg={len(all_preds)-sum(all_preds)} | "
           f"True: Pos={sum(all_labels)}, Neg={len(all_labels)-sum(all_labels)}")
 
@@ -312,6 +351,7 @@ def train_epoch(model, dataloader, criterion, optimizer, device, epoch, args):
         'cls_loss': avg_cls_loss,
         'cls_acc': cls_acc,  # case-level
         'cls_f1': cls_f1,    # case-level
+        'seg_dice': train_seg_dice,  # 训练分割Dice
         'slice_acc': slice_acc if args.train_mode == 'slice' else cls_acc,
         'slice_f1': slice_f1 if args.train_mode == 'slice' else cls_f1
     }
@@ -479,8 +519,8 @@ def validate(model, dataloader, criterion, device, args, cls_threshold=None, epo
 
                     vis_mask = gt_mask_3d  # 保存用于可视化
 
-                    # 对于2.5D模型，计算每个被预测位置的2D Dice，然后平均
-                    # 聚合后的预测中，weight_map > 0的位置是有效预测
+                    # 对于2.5D模型，只计算有胰腺GT的slice的2D Dice
+                    # 关键修复：只计算gt_slice.max() > 0的slice，避免无胰腺slice拉低指标
                     valid_slices = []
                     slice_dice_scores = []
 
@@ -488,15 +528,13 @@ def validate(model, dataloader, criterion, device, args, cls_threshold=None, epo
                         pred_slice = aggregated_seg[d_idx]
                         gt_slice = gt_mask_3d[d_idx]
 
-                        # 检查这个slice是否有有效预测 (weight_map > 0)
-                        # 简化：对于stride=1, slices_per_input=3，中间slice都有预测
-                        # 直接计算所有非零预测slice的Dice
-                        if pred_slice.max() > 0 or gt_slice.max() > 0:
+                        # 只计算有胰腺GT的slice（关键修复）
+                        if gt_slice.max() > 0:
                             dice_2d = compute_2d_dice(pred_slice, gt_slice)
                             slice_dice_scores.append(dice_2d)
                             valid_slices.append(d_idx)
 
-                    # 使用平均2D Dice
+                    # 使用平均2D Dice（只针对有胰腺的slice）
                     if len(slice_dice_scores) > 0:
                         dice = np.mean(slice_dice_scores)
                     else:
