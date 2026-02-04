@@ -350,8 +350,8 @@ def validate(model, dataloader, criterion, device, args, cls_threshold=None, epo
             case_predictions[case_id]['cls_probs'].append(cls_probs[i])
             case_predictions[case_id]['seg_outputs'].append(seg_outputs[i, 0])
 
-            # 存储真实mask用于Dice计算
-            if pancreas_masks_3d is not None:
+            # 存储真实mask用于Dice计算（每个case只存储一次）
+            if pancreas_masks_3d is not None and len(case_predictions[case_id]['masks']) == 0:
                 mask_data = pancreas_masks_3d[i]
                 # 如果是3D mask (D, H, W) 或 (1, D, H, W)
                 if len(mask_data.shape) == 3:

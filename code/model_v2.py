@@ -374,7 +374,12 @@ class ResNet253DMultiTask(nn.Module):
                                         padding=(1, 0, 0), bias=False)
         self.temporal_bn = nn.BatchNorm3d(512)
 
-        # 分割解码器
+        # 3D时序聚合用于分割
+        self.seg_temporal_conv = nn.Conv3d(512, 512, kernel_size=(3, 1, 1),
+                                           padding=(1, 0, 0), bias=False)
+        self.seg_temporal_bn = nn.BatchNorm3d(512)
+
+        # 分割解码器 - 逐slice解码后保持3D结构
         self.seg_decoder = nn.ModuleList([
             DecoderBlock(512, 256),
             DecoderBlock(256, 128),
@@ -415,25 +420,37 @@ class ResNet253DMultiTask(nn.Module):
         _, c, h_out, w_out = x4.shape
         x4 = x4.view(b, d, c, h_out, w_out).permute(0, 2, 1, 3, 4)
 
-        # 3D时序卷积
-        x4 = self.temporal_conv(x4)
-        x4 = self.temporal_bn(x4)
-        x4 = F.relu(x4)
+        # 分类: 使用3D时序卷积聚合
+        cls_feat = self.temporal_conv(x4)
+        cls_feat = self.temporal_bn(cls_feat)
+        cls_feat = F.relu(cls_feat)
 
         # 分类: 3D池化
-        cls_feat = self.cls_pool(x4).view(b, -1)
-        cls_out = self.cls_head(cls_feat)
+        cls_pooled = self.cls_pool(cls_feat).view(b, -1)
+        cls_out = self.cls_head(cls_pooled)
 
-        # 分割: 需要解码回原始尺寸
-        # 取中间slice的特征进行2D分割
-        mid_d = d // 2
-        seg_feat = x4[:, :, mid_d, :, :]  # (B, 512, H/32, W/32)
+        # 分割: 独立的3D时序聚合路径
+        seg_feat = self.seg_temporal_conv(x4)
+        seg_feat = self.seg_temporal_bn(seg_feat)
+        seg_feat = F.relu(seg_feat)
 
-        # 解码
+        # 分割: 将(B, C, D, H, W)转换为(B*D, C, H, W)进行逐slice解码
+        # 或者保持3D结构，但使用2D解码器逐slice处理
+        # 这里采用：对每个深度位置独立解码，然后重组为3D
+
+        b, c, d_out, h_out, w_out = seg_feat.shape
+        # (B, C, D, H, W) -> (B*D, C, H, W)
+        seg_feat_2d = seg_feat.permute(0, 2, 1, 3, 4).contiguous().view(b * d_out, c, h_out, w_out)
+
+        # 解码: 每个slice独立通过解码器
         for decoder in self.seg_decoder:
-            seg_feat = decoder(seg_feat)
+            seg_feat_2d = decoder(seg_feat_2d)
 
-        seg_out = self.seg_head(seg_feat)
+        # 分割头
+        seg_out_2d = self.seg_head(seg_feat_2d)  # (B*D, 1, H, W)
+
+        # 重组回3D: (B*D, 1, H, W) -> (B, 1, D, H, W)
+        seg_out = seg_out_2d.view(b, d_out, 1, seg_out_2d.shape[-2], seg_out_2d.shape[-1]).permute(0, 2, 1, 3, 4)
 
         return {
             'segmentation': seg_out,
@@ -546,7 +563,14 @@ class FocalLoss(nn.Module):
     def forward(self, inputs, targets):
         # 计算交叉熵 (使用类别权重)
         ce_loss = F.cross_entropy(inputs, targets, weight=self.cls_weights, reduction='none')
-        pt = torch.exp(-ce_loss)
+
+        # 数值稳定性：防止pt过小时exp下溢
+        # 使用clamp限制ce_loss范围，防止pt接近0或1时的数值问题
+        ce_loss_clamped = ce_loss.clamp(min=1e-7, max=50.0)
+        pt = torch.exp(-ce_loss_clamped)
+
+        # 进一步限制pt范围，防止(1-pt)出现数值问题
+        pt = pt.clamp(min=1e-7, max=1.0 - 1e-7)
 
         # 调整alpha: 对正类样本(假设为少数类1)给予更高权重
         # alpha_t = alpha for positive class, 1-alpha for negative class

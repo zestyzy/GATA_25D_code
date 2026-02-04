@@ -268,27 +268,39 @@ class PancreasCaseDataset(Dataset):
         # 数据增强 (空间域)
         if self.transform is not None:
             # 对每个slice应用相同的空间变换
-            seed = np.random.randint(2147483647)
+            # 使用numpy生成随机种子，避免污染PyTorch全局随机状态
+            rng = np.random.RandomState(np.random.randint(2147483647))
+            seed = rng.randint(2147483647)
+
             image_aug = []
             pancreas_aug = []
             lesion_aug = []
 
+            # 保存当前随机状态
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+
             for d in range(image_tensor.shape[1]):  # 遍历D维度
-                torch.manual_seed(seed)
+                # 使用确定性种子，但偏移slice索引以增加多样性
+                # 同时避免重复设置全局种子
+                torch.manual_seed(seed + d)
                 img_d = self.transform(image_tensor[0, d:d+1, :, :])
                 image_aug.append(img_d)
 
-                torch.manual_seed(seed)
+                torch.manual_seed(seed + d)
                 pan_d = self.transform(pancreas_tensor[0, d:d+1, :, :])
                 pancreas_aug.append(pan_d)
 
-                torch.manual_seed(seed)
+                torch.manual_seed(seed + d)
                 les_d = self.transform(lesion_tensor[0, d:d+1, :, :])
                 lesion_aug.append(les_d)
 
             image_tensor = torch.stack(image_aug, dim=1)
             pancreas_tensor = torch.stack(pancreas_aug, dim=1)
             lesion_tensor = torch.stack(lesion_aug, dim=1)
+
+            # 恢复随机性：重新播种一个基于时间的随机种子
+            torch.seed()
 
         return {
             'image': image_tensor,  # (1, D, H, W)
