@@ -123,8 +123,9 @@ def evaluate_dataset(model, dataloader, device, model_type='2.5d', args=None):
         # 聚合分类预测
         cls_probs = np.array(case_data['cls_probs'])
         avg_cls_prob = cls_probs.mean(axis=0)
-        pred_label = int(avg_cls_prob.argmax())
         pred_prob = float(avg_cls_prob[1])
+        # 使用与训练/验证一致的阈值0.4
+        pred_label = 1 if pred_prob >= 0.4 else 0
 
         all_preds.append(pred_label)
         all_labels.append(case_data['label'])
@@ -144,13 +145,23 @@ def evaluate_dataset(model, dataloader, device, model_type='2.5d', args=None):
                 (depth, image_size, image_size)
             )
 
-            # 计算3D Dice (如果有ground truth)
+            # 计算2D Dice (只在有胰腺GT的slice上计算，与train_v2.py一致)
             if len(case_data['masks_3d']) > 0:
                 gt_mask = case_data['masks_3d']
                 if gt_mask.shape == aggregated_seg.shape:
-                    seg_pred_binary = (aggregated_seg > 0.5).astype(np.float32)
-                    dice = compute_dice_volume(seg_pred_binary, gt_mask)
-                    seg_dice_scores.append(dice)
+                    # 逐slice计算2D Dice，只计算有胰腺GT的slice
+                    slice_dice_scores = []
+                    for d_idx in range(gt_mask.shape[0]):
+                        gt_slice = gt_mask[d_idx]
+                        pred_slice = aggregated_seg[d_idx]
+                        # 只计算有胰腺GT的slice
+                        if gt_slice.max() > 0:
+                            dice_2d = compute_2d_dice(pred_slice, gt_slice)
+                            slice_dice_scores.append(dice_2d)
+                    # 使用平均2D Dice
+                    if len(slice_dice_scores) > 0:
+                        dice = np.mean(slice_dice_scores)
+                        seg_dice_scores.append(dice)
 
     metrics = {
         'accuracy': accuracy_score(all_labels, all_preds),
@@ -187,6 +198,27 @@ def compute_dice_volume(pred, target, smooth=1e-5):
     target_flat = target.flatten()
     intersection = np.sum(pred_flat * target_flat)
     union = np.sum(pred_flat) + np.sum(target_flat)
+    dice = (2. * intersection + smooth) / (union + smooth)
+    return dice
+
+
+def compute_2d_dice(pred, target, smooth=1e-5):
+    """
+    计算2D Dice系数
+    Args:
+        pred: (H, W) 预测概率或二值化预测
+        target: (H, W) 二值化真实标签
+    """
+    # 二值化预测
+    pred_binary = (pred > 0.5).astype(np.float32)
+    target_binary = (target > 0.5).astype(np.float32)
+
+    pred_flat = pred_binary.flatten()
+    target_flat = target_binary.flatten()
+
+    intersection = np.sum(pred_flat * target_flat)
+    union = np.sum(pred_flat) + np.sum(target_flat)
+
     dice = (2. * intersection + smooth) / (union + smooth)
     return dice
 
