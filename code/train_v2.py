@@ -179,15 +179,18 @@ def get_dataloaders(args):
 
 def train_epoch(model, dataloader, criterion, optimizer, device, epoch, args):
     """训练一个epoch，带tqdm进度条
-    分类指标按case级别聚合计算，与验证阶段保持一致
+    分类指标同时计算case-level和slice-level，明确区分统计口径
     """
     model.train()
     total_loss = 0
     total_seg_loss = 0
     total_cls_loss = 0
 
-    # case级别聚合 - 与验证阶段保持一致
+    # case级别聚合
     case_predictions = {}  # case_id -> {'cls_probs': [], 'label': int}
+    # slice级别统计（用于对比，避免重复标签导致的虚高）
+    slice_preds = []
+    slice_labels = []
 
     # 使用tqdm包装dataloader
     pbar = tqdm(dataloader, desc=f'Epoch {epoch+1} [Train]', leave=False)
@@ -231,9 +234,13 @@ def train_epoch(model, dataloader, criterion, optimizer, device, epoch, args):
         total_seg_loss += losses['seg'].item()
         total_cls_loss += losses['cls'].item()
 
-        # 收集分类预测 (按case聚合)
+        # 收集分类预测 (按case聚合 + slice级别统计)
         cls_probs = torch.softmax(outputs['classification'], dim=1).cpu().numpy()
         pos_probs = cls_probs[:, 1]  # 正类概率
+        # slice-level预测（使用0.4阈值）
+        batch_slice_preds = (pos_probs >= 0.4).astype(int)
+        slice_preds.extend(batch_slice_preds)
+        slice_labels.extend(gata6_labels.cpu().numpy())
 
         for i, case_id in enumerate(case_ids):
             case_id = int(case_id)
@@ -254,7 +261,16 @@ def train_epoch(model, dataloader, criterion, optimizer, device, epoch, args):
             'cls': f'{current_cls:.4f}'
         })
 
-    # 按case聚合计算指标 (与验证阶段一致)
+    n_batches = len(dataloader)
+    avg_loss = total_loss / n_batches
+    avg_seg_loss = total_seg_loss / n_batches
+    avg_cls_loss = total_cls_loss / n_batches
+
+    # 计算slice-level指标（反映重复标签的影响）
+    slice_acc = accuracy_score(slice_labels, slice_preds)
+    slice_f1 = f1_score(slice_labels, slice_preds, zero_division=0)
+
+    # 按case聚合计算指标 (真实case-level性能)
     all_preds = []
     all_labels = []
     all_probs = []
@@ -271,20 +287,22 @@ def train_epoch(model, dataloader, criterion, optimizer, device, epoch, args):
         all_labels.append(case_data['label'])
         all_probs.append(avg_prob)
 
-    n_batches = len(dataloader)
-    avg_loss = total_loss / n_batches
-    avg_seg_loss = total_seg_loss / n_batches
-    avg_cls_loss = total_cls_loss / n_batches
-
     # 计算case-level指标
     cls_acc = accuracy_score(all_labels, all_preds)
     cls_f1 = f1_score(all_labels, all_preds, zero_division=0)
     cls_precision = precision_score(all_labels, all_preds, zero_division=0)
     cls_recall = recall_score(all_labels, all_preds, zero_division=0)
 
-    # 打印训练分类指标 (合并为一行)
-    print(f"  [Train] Acc: {cls_acc:.4f}, Precision: {cls_precision:.4f}, "
-          f"Recall: {cls_recall:.4f}, F1: {cls_f1:.4f}")
+    # 打印训练分类指标（区分case-level和slice-level）
+    if args.train_mode == 'slice':
+        # 2.5D模式：显示两种口径的对比
+        print(f"  [Train Slice-level] Acc: {slice_acc:.4f}, F1: {slice_f1:.4f} (重复标签，参考用)")
+        print(f"  [Train Case-level]  Acc: {cls_acc:.4f}, Precision: {cls_precision:.4f}, "
+              f"Recall: {cls_recall:.4f}, F1: {cls_f1:.4f} (真实性能)")
+    else:
+        # case模式：只有case-level
+        print(f"  [Train] Acc: {cls_acc:.4f}, Precision: {cls_precision:.4f}, "
+              f"Recall: {cls_recall:.4f}, F1: {cls_f1:.4f}")
     print(f"  [Train Distribution] Pred: Pos={sum(all_preds)}, Neg={len(all_preds)-sum(all_preds)} | "
           f"True: Pos={sum(all_labels)}, Neg={len(all_labels)-sum(all_labels)}")
 
@@ -292,8 +310,10 @@ def train_epoch(model, dataloader, criterion, optimizer, device, epoch, args):
         'loss': avg_loss,
         'seg_loss': avg_seg_loss,
         'cls_loss': avg_cls_loss,
-        'cls_acc': cls_acc,
-        'cls_f1': cls_f1
+        'cls_acc': cls_acc,  # case-level
+        'cls_f1': cls_f1,    # case-level
+        'slice_acc': slice_acc if args.train_mode == 'slice' else cls_acc,
+        'slice_f1': slice_f1 if args.train_mode == 'slice' else cls_f1
     }
 
 

@@ -218,6 +218,66 @@ class PancreasCaseDataset(Dataset):
 
         return image
 
+    def _apply_spatial_transform_sync(self, image, pancreas_mask, lesion_mask):
+        """
+        同步应用空间变换（2.5D专用修复）
+        关键修复：image使用双线性插值，mask使用最近邻插值保持二值性
+
+        Args:
+            image: (H, W) tensor
+            pancreas_mask: (H, W) tensor
+            lesion_mask: (H, W) tensor
+        Returns:
+            变换后的image, pancreas_mask, lesion_mask
+        """
+        from torchvision import transforms
+        from torchvision.transforms import functional as F
+
+        # 确保是tensor并添加channel维度用于transform
+        img = image.unsqueeze(0) if image.dim() == 2 else image
+        pan_mask = pancreas_mask.unsqueeze(0) if pancreas_mask.dim() == 2 else pancreas_mask
+        les_mask = lesion_mask.unsqueeze(0) if lesion_mask.dim() == 2 else lesion_mask
+
+        h, w = img.shape[-2:]
+
+        # 1. 随机水平翻转 (50%概率)
+        if torch.rand(1) < 0.5:
+            img = F.hflip(img)
+            pan_mask = F.hflip(pan_mask)
+            les_mask = F.hflip(les_mask)
+
+        # 2. 随机垂直翻转 (50%概率)
+        if torch.rand(1) < 0.5:
+            img = F.vflip(img)
+            pan_mask = F.vflip(pan_mask)
+            les_mask = F.vflip(les_mask)
+
+        # 3. 随机旋转 (-15到15度)
+        angle = torch.empty(1).uniform_(-15, 15).item()
+        # image使用双线性插值
+        img = F.rotate(img, angle, interpolation=transforms.InterpolationMode.BILINEAR)
+        # mask使用最近邻插值保持二值
+        pan_mask = F.rotate(pan_mask, angle, interpolation=transforms.InterpolationMode.NEAREST)
+        les_mask = F.rotate(les_mask, angle, interpolation=transforms.InterpolationMode.NEAREST)
+
+        # 4. 随机仿射变换 (平移和缩放)
+        tx = torch.empty(1).uniform_(-0.1, 0.1).item() * w
+        ty = torch.empty(1).uniform_(-0.1, 0.1).item() * h
+        scale = torch.empty(1).uniform_(0.9, 1.1).item()
+
+        img = F.affine(img, angle=0, translate=(tx, ty), scale=scale, shear=0,
+                       interpolation=transforms.InterpolationMode.BILINEAR)
+        pan_mask = F.affine(pan_mask, angle=0, translate=(tx, ty), scale=scale, shear=0,
+                            interpolation=transforms.InterpolationMode.NEAREST)
+        les_mask = F.affine(les_mask, angle=0, translate=(tx, ty), scale=scale, shear=0,
+                            interpolation=transforms.InterpolationMode.NEAREST)
+
+        # 二值化mask（确保没有插值产生的中间值）
+        pan_mask = (pan_mask > 0.5).float()
+        les_mask = (les_mask > 0.5).float()
+
+        return img.squeeze(0), pan_mask.squeeze(0), les_mask.squeeze(0)
+
     def __len__(self):
         return len(self.samples)
 
@@ -265,42 +325,31 @@ class PancreasCaseDataset(Dataset):
         pancreas_tensor = torch.from_numpy(pancreas_resampled).float().unsqueeze(0)
         lesion_tensor = torch.from_numpy(lesion_resampled).float().unsqueeze(0)
 
-        # 数据增强 (空间域)
+        # 数据增强 (空间域) - 2.5D专用修复版
+        # 关键修复：mask使用最近邻插值保持二值性，image使用双线性插值
         if self.transform is not None:
-            # 对每个slice应用相同的空间变换
-            # 使用numpy生成随机种子，避免污染PyTorch全局随机状态
-            rng = np.random.RandomState(np.random.randint(2147483647))
-            seed = rng.randint(2147483647)
-
             image_aug = []
             pancreas_aug = []
             lesion_aug = []
 
-            # 保存当前随机状态
-            if torch.cuda.is_available():
-                torch.cuda.synchronize()
-
             for d in range(image_tensor.shape[1]):  # 遍历D维度
-                # 使用确定性种子，但偏移slice索引以增加多样性
-                # 同时避免重复设置全局种子
-                torch.manual_seed(seed + d)
-                img_d = self.transform(image_tensor[0, d:d+1, :, :])
-                image_aug.append(img_d)
+                img_d = image_tensor[0, d, :, :]  # (H, W)
+                pan_d = pancreas_tensor[0, d, :, :]  # (H, W)
+                les_d = lesion_tensor[0, d, :, :]  # (H, W)
 
-                torch.manual_seed(seed + d)
-                pan_d = self.transform(pancreas_tensor[0, d:d+1, :, :])
-                pancreas_aug.append(pan_d)
+                # 使用albumentations风格的同步变换（如果可用）
+                # 或者使用torchvision.functional进行手动同步变换
+                img_aug, pan_aug, les_aug = self._apply_spatial_transform_sync(
+                    img_d, pan_d, les_d
+                )
 
-                torch.manual_seed(seed + d)
-                les_d = self.transform(lesion_tensor[0, d:d+1, :, :])
-                lesion_aug.append(les_d)
+                image_aug.append(img_aug.unsqueeze(0).unsqueeze(0))  # (1, 1, H, W)
+                pancreas_aug.append(pan_aug.unsqueeze(0).unsqueeze(0))
+                lesion_aug.append(les_aug.unsqueeze(0).unsqueeze(0))
 
-            image_tensor = torch.stack(image_aug, dim=1)
-            pancreas_tensor = torch.stack(pancreas_aug, dim=1)
-            lesion_tensor = torch.stack(lesion_aug, dim=1)
-
-            # 恢复随机性：重新播种一个基于时间的随机种子
-            torch.seed()
+            image_tensor = torch.cat(image_aug, dim=1)  # (1, D, H, W)
+            pancreas_tensor = torch.cat(pancreas_aug, dim=1)
+            lesion_tensor = torch.cat(lesion_aug, dim=1)
 
         return {
             'image': image_tensor,  # (1, D, H, W)
